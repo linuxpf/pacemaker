@@ -1,0 +1,333 @@
+pacemaker负载 （2014122更新）
+参考文档
+#快速向导 http://clusterlabs.org/quickstart.html
+#http://clusterlabs.org/wiki/Fencing_topology
+#推荐红帽文档，非常详细 https://access.redhat.com/documentation/en-US/Red_Hat_Enterprise_Linux/6/html-single/Configuring_the_Red_Hat_High_Availability_Add-On_with_Pacemaker/index.html
+#http://www.vmwareadmins.com/using-haproxy-as-a-load-balancer-for-open-stack-services/
+
+1.安装pacemaker 
+安装环境CENTOS6U5_X64 CENTOS6U6_X64
+案例 
+test1 pcs1
+test2 pcs2
+在所有的节点上，执行安装pacemaker
+
+yum  -y install pacemaker cman pcs ccs resource-agents
+
+[ `cat /etc/sysctl.conf |grep 'net.ipv4.ip_nonlocal_bind=1'|wc -l`  -lt 1 ] && sed -i '/net.ipv4.ip_forward/anet.ipv4.ip_nonlocal_bind=1' /etc/sysctl.conf
+
+在其中一台建立集群pacemaker1  
+[ONE] # ccs -f /etc/cluster/cluster.conf --createcluster pacemaker1 
+[ONE] # ccs -f /etc/cluster/cluster.conf --addnode node1
+[ONE] # ccs -f /etc/cluster/cluster.conf --addnode node2
+
+配置 fencing requests to Pacemaker
+[ONE] # ccs -f /etc/cluster/cluster.conf --addfencedev pcmk agent=fence_pcmk
+[ONE] # ccs -f /etc/cluster/cluster.conf --addmethod pcmk-redirect node1
+[ONE] # ccs -f /etc/cluster/cluster.conf --addmethod pcmk-redirect node2 
+[ONE] # ccs -f /etc/cluster/cluster.conf --addfenceinst pcmk node1 pcmk-redirect port=node1 
+[ONE] # ccs -f /etc/cluster/cluster.conf --addfenceinst pcmk node2 pcmk-redirect port=node2
+在test1执行命令
+ccs -f /etc/cluster/cluster.conf --createcluster openstackgroup
+ccs -f /etc/cluster/cluster.conf --addnode test1
+ccs -f /etc/cluster/cluster.conf --addnode test2
+ccs -f /etc/cluster/cluster.conf --addfencedev pcmk agent=fence_pcmk
+ccs -f /etc/cluster/cluster.conf --addmethod pcmk-redirect test1
+ccs -f /etc/cluster/cluster.conf --addmethod pcmk-redirect test2
+ccs -f /etc/cluster/cluster.conf --addfenceinst pcmk test1 pcmk-redirect port=test1
+ccs -f /etc/cluster/cluster.conf --addfenceinst pcmk test2 pcmk-redirect port=test2
+
+copy /etc/cluster/cluster.conf to all the other nodes that will be part of the cluster.
+scp -p /etc/cluster/cluster.conf root@test2:/etc/cluster/cluster.conf
+内容如下：
+cat /etc/cluster/cluster.conf
+<cluster config_version="8" name="openstackgroup">
+  <fence_daemon/>
+  <clusternodes>
+    <clusternode name="test1" nodeid="1">
+      <fence>
+        <method name="pcmk-redirect">
+          <device name="pcmk" port="test1"/>
+        </method>
+      </fence>
+    </clusternode>
+    <clusternode name="test2" nodeid="2">
+      <fence>
+        <method name="pcmk-redirect">
+          <device name="pcmk" port="test2"/>
+        </method>
+      </fence>
+    </clusternode>
+  </clusternodes>
+  <cman/>
+  <fencedevices>
+    <fencedevice agent="fence_pcmk" name="pcmk"/>
+  </fencedevices>
+  <rm>
+    <failoverdomains/>
+    <resources/>
+  </rm>
+</cluster>
+ 
+[ALL] # echo "CMAN_QUORUM_TIMEOUT=0" >> /etc/sysconfig/cman
+[ALL] # service cman start 
+[ALL] # service pacemaker start
+chkconfig cman on
+chkconfig pacemaker  on
+禁用Fencing 设备，后续再配置，跟进
+
+[ONE] # pcs property set stonith-enabled=false
+注：enabled fence_ipmilan，一般服务器DELL IDRAC，IBM RSA等都支持IPMI，冲突的操作reboot或者shutdown;（并且配置内网卡IP能与ipmi网段通信）
+pcs stonith create fence_${HostP1}_ipmi fence_ipmilan \
+    pcmk_host_list="${HostP1}" ipaddr="${HostP1_IPMI}" \
+    action="reboot" login="root" passwd="password" delay=15 \
+    op monitor interval=60s
+pcs stonith create fence_${HostP2}_ipmi fence_ipmilan \
+    pcmk_host_list="${HostP2}" ipaddr="${HostP2_IPMI}" \
+    action="reboot" login="root" passwd="password" delay=15 \
+    op monitor interval=60s
+
+pcs property set stonith-enabled=true
+
+[root@test1 ~]# pcs status
+Cluster name: openstackgroup
+Last updated: Wed Dec 24 11:28:58 2014
+Last change: Wed Dec 24 11:17:51 2014
+Stack: cman
+Current DC: test1 - partition with quorum
+Version: 1.1.11-97629de
+2 Nodes configured
+0 Resources configured
+
+
+Online: [ test1 test2 ]
+
+Full list of resources:
+
+2.配置资源
+2.1配置 VIP
+#create ClusterIP
+#pcs resource create ClusterIP IPaddr2 ip=${VIP}  cidr_netmask=32 op monitor interval=30s
+pcs resource create ClusterIP_Public ocf:heartbeat:IPaddr2 ip=10.10.191.111 nic=br-ex  cidr_netmask=32 op monitor interval=30s 
+pcs resource create ClusterIP_Private ocf:heartbeat:IPaddr2 ip=10.10.190.111 nic=eth0  cidr_netmask=32 op monitor interval=30s 
+增加constraint 约束规则，使ClusterIP_Private  依赖 ClusterIP_Private  始终同时在一台上，
+pcs constraint colocation add ClusterIP_Private  ClusterIP_Public  INFINITY
+
+增加为add,删除操作remove,更多请查看pcs constraint help帮助  
+2.2 增加haproxy resource， 克隆资源到所有pacemaker节点
+
+pcs resource create HaproxyLB lsb:haproxy op monitor interval="20" timeout="30"  op start interval="0" timeout="30"  op stop interval="0" timeout="30"   --clone
+参考帮助：
+    create <resource id> <standard:provider:type|type> [resource options]
+           [op <operation action> <operation options> [<operation action>
+           <operation options>]...] [meta <meta options>...]
+           [--clone <clone options> | --master <master options> |
+           --group <group name>] [--disabled]
+        Create specified resource.  If --clone is used a clone resource is
+        created if --master is specified a master/slave resource is created.
+        If --group is specified the resource is added to the group named.
+        If --disabled is specified the resource is not started automatically.
+        Example: pcs resource create VirtualIP ocf:heartbeat:IPaddr2 \
+                     ip=192.168.0.99 cidr_netmask=32 op monitor interval=30s \
+                     nic=eth2
+                 Create a new resource called 'VirtualIP' with IP address
+                 192.168.0.99, netmask of 32, monitored everything 30 seconds,
+                 on eth2.
+
+2.3 配置 qpidd 资源pcs resource create qpidd lsb:qpidd --clone
+#lsb:qpidd
+pcs resource create p_qpidd lsb:qpidd op monitor interval="30s" timeout="30s" --clone
+
+#HaproxyLB 如果配置成clone则不需要;pcs constraint colocation add HaproxyLB ClusterIP_Public  INFINITY
+增加启动次序，2个VIP最先启动。
+pcs constraint order ClusterIP_Public then HaproxyLB
+# pcs constraint order ClusterIP_Public then HaproxyLB
+Adding ClusterIP_Public HaproxyLB (kind: Mandatory) (Options: first-action=start then-action=start)
+
+# pcs constraint order ClusterIP_Private  then HaproxyLB
+
+2.4 配置nova-consoleauth 参考https://openstack.redhat.com/RDO_HighlyAvailable_and_LoadBalanced_Control_Services
+需要确保nova-consoleauth只能够一台运行
+ nova-consoleauth also needs to be added to pacemaker, this will ensure that it only runs on one node. Your remote console will not work if consoleauth is running in more than one place.
+pcs resource create consoleauth lsb:openstack-nova-consoleauth
+
+
+2.5 增加网络服务
+ 2.5.1增加 neutron L3 agent resource to Pacemaker
+# cd /usr/lib/ocf/resource.d/openstack
+# wget https://raw.github.com/madkiss/openstack-resource-agents/master/ocf/neutron-agent-l3
+# chmod a+rx neutron-l3-agent
+pcs resource create  p_neutron-l3-agent ocf:openstack:neutron-agent-l3 params config="/etc/neutron/neutron.conf" plugin_config="/etc/neutron/l3_agent.ini" op monitor interval="30s" timeout="30s"
+
+ 2.5.2增加 neutron DHCP agent resource to Pacemaker
+# cd /usr/lib/ocf/resource.d/openstack
+# wget https://raw.github.com/madkiss/openstack-resource-agents/master/ocf/neutron-agent-dhcp
+# chmod a+rx neutron-agent-dhcp
+
+ # pcs resource create  p_neutron-dhcp-agent ocf:openstack:neutron-agent-dhcp   params config="/etc/neutron/neutron.conf"   plugin_config="/etc/neutron/dhcp_agent.ini" op monitor interval="30s" timeout="30s"
+ 
+ 2.5.3增加neutron-metadata-agent to Pacemaker
+# cd /usr/lib/ocf/resource.d/openstack
+# wget https://raw.github.com/madkiss/openstack-resource-agents/master/ocf/neutron-metadata-agent
+# chmod a+rx neutron-metadata-agent
+
+pcs resource create p_neutron-metadata-agent ocf:openstack:neutron-metadata-agent arams config="/etc/neutron/neutron.conf" agent_config="/etc/neutron/metadata_agent.ini" op monitor interval="30s" timeout="30s" --clone
+
+2.5.4建立一个g_services_network资源组来方便 管理neutron 网络服务组件
+pcs resource group add g_services_network p_neutron-l3-agent p_neutron-dhcp-agent p_neutron-metadata_agent
+
+
+ p_neutron-metadata_agent提示是clone资源，无法加入资源组中：将p_neutron-l3-agent p_neutron-dhcp-agent  consoleauth放到一个组来管理。
+ pcs resource group add g_services_network p_neutron-l3-agent p_neutron-dhcp-agent  consoleauth
+
+2.6 资源整合约束规则
+
+pcs constraint colocation add p_neutron-l3-agent  p_neutron-dhcp-agent INFINITY 
+pcs constraint colocation add p_neutron-dhcp-agent  ClusterIP_Public  INFINITY 
+pcs constraint colocation add g_services_network   ClusterIP_Public  INFINITY
+
+pcs constraint order p_neutron-metadata-agent-clone  then p_neutron-l3-agent
+pcs constraint order p_neutron-metadata-agent-clone then p_neutron-dhcp-agent
+
+[root@test1 ~]# pcs constraint order p_neutron-metadata-agent-clone  then p_neutron-l3-agent
+Adding p_neutron-metadata-agent-clone p_neutron-l3-agent (kind: Mandatory) (Options: first-action=start then-action=start)
+[root@test1 ~]# pcs constraint order p_neutron-metadata-agent-clone then p_neutron-dhcp-agent
+Adding p_neutron-metadata-agent-clone p_neutron-dhcp-agent (kind: Mandatory) (Options: first-action=start then-action=start)
+
+
+3.配置查看
+[root@test1 nova]# pcs status
+Cluster name: openstackgroup
+Last updated: Thu Dec 25 10:30:19 2014
+Last change: Wed Dec 24 19:36:22 2014
+Stack: cman
+Current DC: test2 - partition with quorum
+Version: 1.1.11-97629de
+2 Nodes configured
+11 Resources configured
+
+
+Online: [ test1 test2 ]
+
+Full list of resources:
+
+ClusterIP_Public       (ocf::heartbeat:IPaddr2):       Started test1
+ClusterIP_Private      (ocf::heartbeat:IPaddr2):       Started test1
+Clone Set: HaproxyLB-clone [HaproxyLB]
+     Started: [ test1 test2 ]
+Clone Set: p_qpidd-clone [p_qpidd]
+     Started: [ test1 test2 ]
+Clone Set: p_neutron-metadata-agent-clone [p_neutron-metadata-agent]
+     Started: [ test1 test2 ]
+Resource Group: g_services_network
+     p_neutron-l3-agent (ocf::openstack:neutron-agent-l3):      Started test1
+     p_neutron-dhcp-agent       (ocf::openstack:neutron-agent-dhcp):    Started test1
+     consoleauth        (lsb:openstack-nova-consoleauth):       Started test1
+
+[root@test1 ~]# netstat -tunlp|grep corosync
+udp        0      0 10.10.190.5:5404            0.0.0.0:*                               1613/corosync
+udp        0      0 10.10.190.5:5405            0.0.0.0:*                               1613/corosync
+udp        0      0 239.192.5.248:5405          0.0.0.0:*                               1613/corosync
+
+
+[root@test1 nova]# pcs config
+Cluster Name: openstackgroup
+Corosync Nodes:
+test1 test2
+Pacemaker Nodes:
+test1 test2
+
+Resources:
+Resource: ClusterIP_Public (class=ocf provider=heartbeat type=IPaddr2)
+  Attributes: ip=10.10.191.111 nic=br-ex cidr_netmask=32
+  Operations: start interval=0s timeout=20s (ClusterIP_Public-start-timeout-20s)
+              stop interval=0s timeout=20s (ClusterIP_Public-stop-timeout-20s)
+              monitor interval=30s (ClusterIP_Public-monitor-interval-30s)
+Resource: ClusterIP_Private (class=ocf provider=heartbeat type=IPaddr2)
+  Attributes: ip=10.10.190.111 nic=eth0 cidr_netmask=32
+  Operations: start interval=0s timeout=20s (ClusterIP_Private-start-timeout-20s)
+              stop interval=0s timeout=20s (ClusterIP_Private-stop-timeout-20s)
+              monitor interval=30s (ClusterIP_Private-monitor-interval-30s)
+Clone: HaproxyLB-clone
+  Resource: HaproxyLB (class=lsb type=haproxy)
+   Operations: monitor interval=20 timeout=30 (HaproxyLB-monitor-interval-20)
+               start interval=0 timeout=30 (HaproxyLB-start-interval-0)
+               stop interval=0 timeout=30 (HaproxyLB-stop-interval-0)
+Clone: p_qpidd-clone
+  Resource: p_qpidd (class=lsb type=qpidd)
+   Operations: monitor interval=30s timeout=30s (p_qpidd-monitor-interval-30s)
+Clone: p_neutron-metadata-agent-clone
+  Resource: p_neutron-metadata-agent (class=ocf provider=openstack type=neutron-metadata-agent)
+   Attributes: config=/etc/neutron/neutron.conf agent_config=/etc/neutron/metadata_agent.ini
+   Operations: start interval=0s timeout=10 (p_neutron-metadata-agent-start-timeout-10)
+               stop interval=0s timeout=10 (p_neutron-metadata-agent-stop-timeout-10)
+               monitor interval=30s timeout=30s (p_neutron-metadata-agent-monitor-interval-30s)
+Group: g_services_network
+  Resource: p_neutron-l3-agent (class=ocf provider=openstack type=neutron-agent-l3)
+   Attributes: config=/etc/neutron/neutron.conf plugin_config=/etc/neutron/l3_agent.ini
+   Operations: start interval=0s timeout=20 (p_neutron-l3-agent-start-timeout-20)
+               stop interval=0s timeout=20 (p_neutron-l3-agent-stop-timeout-20)
+               monitor interval=30s timeout=30s (p_neutron-l3-agent-monitor-interval-30s)
+  Resource: p_neutron-dhcp-agent (class=ocf provider=openstack type=neutron-agent-dhcp)
+   Attributes: config=/etc/neutron/neutron.conf plugin_config=/etc/neutron/dhcp_agent.ini
+   Operations: start interval=0s timeout=20 (p_neutron-dhcp-agent-start-timeout-20)
+               stop interval=0s timeout=20 (p_neutron-dhcp-agent-stop-timeout-20)
+               monitor interval=30s timeout=30s (p_neutron-dhcp-agent-monitor-interval-30s)
+  Resource: consoleauth (class=lsb type=openstack-nova-consoleauth)
+   Operations: monitor interval=60s (consoleauth-monitor-interval-60s)
+
+Stonith Devices:
+Fencing Levels:
+
+Location Constraints:
+Ordering Constraints:
+  start ClusterIP_Public then start HaproxyLB (kind:Mandatory) (id:order-ClusterIP_Public-HaproxyLB-mandatory)
+  start ClusterIP_Private then start HaproxyLB (kind:Mandatory) (id:order-ClusterIP_Private-HaproxyLB-mandatory)
+  start p_neutron-metadata-agent-clone then start p_neutron-l3-agent (kind:Mandatory) (id:order-p_neutron-metadata-agent-clone-p_neutron-l3-agent-mandatory)
+  start p_neutron-metadata-agent-clone then start p_neutron-dhcp-agent (kind:Mandatory) (id:order-p_neutron-metadata-agent-clone-p_neutron-dhcp-agent-mandatory)
+Colocation Constraints:
+  ClusterIP_Private with ClusterIP_Public (score:INFINITY) (id:colocation-ClusterIP_Private-ClusterIP_Public-INFINITY)
+  p_neutron-l3-agent with p_neutron-dhcp-agent (score:INFINITY) (id:colocation-p_neutron-l3-agent-p_neutron-dhcp-agent-INFINITY)
+  p_neutron-dhcp-agent with ClusterIP_Public (score:INFINITY) (id:colocation-p_neutron-dhcp-agent-ClusterIP_Public-INFINITY)
+  g_services_network with ClusterIP_Public (score:INFINITY) (id:colocation-g_services_network-ClusterIP_Public-INFINITY)
+
+Cluster Properties:
+cluster-infrastructure: cman
+dc-version: 1.1.11-97629de
+stonith-enabled: false
+其实可以保存xml配置信息（ Safely using an editor to modify the cluster configuration）
+
+# cibadmin --query > tmp.xml
+# vi tmp.xml
+# cibadmin --replace --xml-file tmp.xml
+4.测试集群
+
+5.1 增加或删除节点
+文档参考https://access.redhat.com/documentation/en-US/Red_Hat_Enterprise_Linux/6/html-single/Configuring_the_Red_Hat_High_Availability_Add-On_with_Pacemaker/index.html#ch-overview-HAAR
+pcs cluster node add node
+
+上述指令同步到/etc/cluster/cluster.conf
+pcs cluster node remove node
+基本概念 资源类型:
+1）primitive（native）: 基本资源，同一时刻只能运行在一个节点，如服务的IP地址
+2）group: 资源组
+3）clone: 克隆资源（可同时运行在多个节点上），要先定义为primitive后才能进行clone。
+4）master/slave: 只能运行2个节点，一主一从
+资源粘性stickiness: 表示资源是否倾向于留在当前节点
+>0: 倾向于留在当前节点
+<0: 倾向于离开此节点
+=0: 由HA来决定去留
+INFINITY: 正无穷大
+-INFINITY: 负无穷大
+资源约束: 资源的启动是要有先后次序的，这时就需要对资源进行约束。资源约束是用以指定在哪些群集节点上运行资源，以何种顺序装载资源，以及特定资源依赖于哪些其它资源。pacemaker共给我们提供了三种资源约束方法:
+1）Location（位置）: 定义资源可以、不可以或尽可能在哪些节点上运行     
+2）Collocation（排列）: 排列约束用以定义集群资源可以或不可以在某个节点上同时运行
+3）Order（顺序）: 顺序约束定义集群资源在节点上启动的顺序
+法定票数quorum:
+集群服务中的每个node都有自己的票数，票数是由DC负责统计，然后形成CIB(集群信息库），然后同步集群信息库到各个节点上，只有quorum大于总票数的二分之一，集群服务才可以继续运行，当quorum小于总票数的二分之一时，会有以下动作:
+ignore(忽略): 当集群服务只有两个节点时，无论谁挂了，都需要切换node，所以要忽略法定票数
+
+freeze(冻结): 已经启动的资源继续运行，不允许新的资源启动
+stop(停止): 停止集群服务，这是默认值
+suicide(自杀): 将所有节点全部隔离
+参考http://www.linuxidc.com/Linux/2014-03/97990.htm
