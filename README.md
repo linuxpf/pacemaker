@@ -5,4 +5,5 @@
  pacemaker_config.txt 
  
 2) pacemaker 使用zabbix监控脚本，正常情况返回为0，节点无集群状态返回-1，存在offline 节点或存在资源resources stop等异常状态返回大于1，为异常服务数量
-   pacemaker_status.py
+   ./pacemaker_status.py
+Usage: ./pacemaker_status.py (nodes|resources)
