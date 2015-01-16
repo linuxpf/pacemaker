@@ -13,7 +13,6 @@ def main(arv):
     elif arv == "nodes":
         nodes_status()
     else:
-        print 'no............'
         usage.status()
         sys.exit(1)
 		
