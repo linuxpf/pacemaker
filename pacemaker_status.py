@@ -75,7 +75,7 @@ def nodes_status():
 
 #pcs status resource resource_show
 def resource_show():
-    output = subprocess.Popen('pcs status resources',stdout=subprocess.PIPE,shell=True)
+    output = subprocess.Popen('/usr/sbin/pcs status resources',stdout=subprocess.PIPE,shell=True)
     output.wait()
     #(output, retval) = utils.run(["pcs", "status", "resources"])
     #print output.stdout.read()
